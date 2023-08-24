@@ -5,7 +5,7 @@ import { Worker } from "worker_threads";
 import { nonceGenerator, runWorker } from "./hasher.js";
 import * as msgpack from "msgpack-lite";
 import { sharedKey } from "curve25519-js";
-
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 const num_cpus = os.cpus().length;
 
 const executor = new Worker("./src/worker.js", {
@@ -15,15 +15,16 @@ const executor = new Worker("./src/worker.js", {
 export class SocketHandler {
   private socket!: net.Socket;
   private list_nodes: Array<[string, number, boolean, number]> = [
-    ["0.0.0.0", 5050, false, 0],
+    ["0.0.0.0", 5050, true, 0],
   ];
-  private selected_node: [string, number, boolean, number] | null = null;
+  public selected_node: [string, number, boolean, number] | null = null;
   private received_data: { [key: number]: any } = {};
   private data_user: any = {};
   public is_listening: boolean = false;
 
+
   private async Checker_Exist_Host(): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise(async (resolve) => {
       for (let i = 0; i < this.list_nodes.length; i++) {
         const start = Date.now();
 
@@ -32,6 +33,7 @@ export class SocketHandler {
 
         this.socket.on("error", (error: any) => {
           if (error.code === "ECONNREFUSED") {
+            this.list_nodes[i][2] = false;
             console.error(
               `Connection refused to the server: ${error.address}:${error.port}`
             );
@@ -49,18 +51,16 @@ export class SocketHandler {
             console.error(`Socket error: ${error.message}`);
           }
         });
-
         this.socket.connect(
           this.list_nodes[i][1],
           this.list_nodes[i][0],
-          () => {
-            this.list_nodes[i][2] = true;
-          }
+          () => {}
         );
-
+        await delay(1000);
+        
         this.socket.end();
         this.list_nodes[i][3] = parseFloat(
-          ((Date.now() - start) / 1000).toFixed(6)
+          ((Date.now() - start) / 1000 - 1).toFixed(6) 
         );
 
         if (this.list_nodes[i][2]) {
@@ -131,6 +131,7 @@ export class SocketHandler {
 
     this.is_listening = true;
     executor.postMessage(this.listen_for_messages);
+    
     return true;
   }
 
