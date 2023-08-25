@@ -18,4 +18,4 @@ Open [http://localhost:3000](http://localhost:3000) to interact it in the browse
 
 ### TODO list
 
-1. Edit in `.env` file #`DEBUG`
+1. Edit in `.env` file a **DEBUG** variable, set it to `false`
