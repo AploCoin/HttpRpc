@@ -2,7 +2,7 @@ import * as net from "net";
 import * as os from "os";
 import * as crypto from "crypto";
 import { Worker } from "worker_threads";
-import { nonceGenerator, runWorker } from "./hasher.js";
+import { fromBigUint, nonceGenerator, runWorker } from "./hasher.js";
 import * as msgpack from "msgpack-lite";
 import { sharedKey } from "curve25519-js";
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -11,6 +11,15 @@ const num_cpus = os.cpus().length;
 const executor = new Worker("./src/worker.js", {
   workerData: { maxWorkers: num_cpus * 1024 },
 });
+
+function toBuffer(arrayBuffer: ArrayBuffer): Buffer {
+  const buffer = Buffer.alloc(arrayBuffer.byteLength);
+  const view = new Uint8Array(arrayBuffer);
+  for (let i = 0; i < buffer.length; ++i) {
+    buffer[i] = view[i];
+  }
+  return buffer;
+}
 
 export class SocketHandler {
   private socket!: net.Socket;
@@ -85,8 +94,8 @@ export class SocketHandler {
         );
 
         this.socket.on("data", (data) => {
-          resolve(data);
           this.socket.destroy(); // Close the connection after receiving data
+          resolve(data);
         });
 
         this.socket.on("error", (err) => {
@@ -109,7 +118,6 @@ export class SocketHandler {
     }
 
     let data = await this.connectAndRead();
-    console.log(data);
     // Convert the server's public key to Uint8Array
     const serverPublicKey = Uint8Array.from(data);
 
@@ -122,7 +130,10 @@ export class SocketHandler {
       .export({ type: "pkcs8", format: "der" })
       .slice(-32);
     // Compute the shared secret using curve25519-js
-    const sharedSecretBuffer = sharedKey(Uint8Array.from(privateKey), serverPublicKey);
+    const sharedSecretBuffer = sharedKey(
+      Uint8Array.from(privateKey),
+      serverPublicKey
+    );
     const sharedSecret = Buffer.from(sharedSecretBuffer);
     const nonceKey = nonceGenerator(sharedSecret);
     const publicKeySys = publicKey
@@ -151,8 +162,7 @@ export class SocketHandler {
     };
 
     this.is_listening = true;
-    executor.postMessage(this.listen_for_messages);
-
+    this.listen_for_messages();
     return true;
   }
 
@@ -160,46 +170,85 @@ export class SocketHandler {
     this.is_listening = false;
   }
 
+  private accumulatedData: Buffer = Buffer.alloc(0);
+  private expectedDataLength: number | null = null;
+
+  /* @TODO fix error 
+  Error propagating packet SendError(PropagatedPacket { packet: Request { id: 0, data: GetBlocksByHeights(GetBlocksByHeightsRequest { start: 1, amount: 1 }) }, source_addr: 0.0.0.0:0 })
+  */
   private async listen_for_messages(): Promise<void> {
     if (!this.data_user || !this.data_user.keys) {
       console.error("Data user or keys not initialized");
       return;
     }
-    while (this.is_listening) {
-      try {
-        const dataSize = this.socket.read(4);
-        const dataLength = dataSize.readUInt32BE(0);
-        const data = this.socket.read(dataLength);
 
-        const decryptedData = await runWorker({
-          task: "decrypt",
-          data: {
-            data: data,
-            key: this.data_user.keys.maintenance.sharedKey,
-            nonce: this.data_user.keys.maintenance.nonceKey,
-          },
-        });
+    this.socket.on("data", async (chunk) => {
+      console.log(chunk);
+      this.accumulatedData = Buffer.concat([this.accumulatedData, chunk]);
 
-        const decompressedData = await runWorker({
-          task: "decompress",
-          data: decryptedData,
-        });
-
-        const unpackedData = msgpack.decode(decompressedData);
-
-        if (unpackedData.Request) {
-          // Handle request
-        } else {
-          const requestId = unpackedData.Response.id;
-          this.received_data[requestId] = unpackedData;
+      while (this.is_listening) {
+        // keep processing as long as there's enough data
+        if (
+          this.expectedDataLength === null &&
+          this.accumulatedData.length >= 4
+        ) {
+          this.expectedDataLength = this.accumulatedData.readUInt32BE(0);
+          this.accumulatedData = this.accumulatedData.slice(4); // remove the length bytes
         }
-      } catch (error) {
-        console.error(`Socket error: ${error}`);
-        break;
-      }
-    }
 
-    this.socket.end();
+        if (
+          this.expectedDataLength !== null &&
+          this.accumulatedData.length >= this.expectedDataLength
+        ) {
+          const messageData = this.accumulatedData.slice(
+            0,
+            this.expectedDataLength
+          );
+          this.accumulatedData = this.accumulatedData.slice(
+            this.expectedDataLength
+          );
+          this.expectedDataLength = null; // reset for the next message
+
+          // Now process the messageData
+          try {
+            const decryptedData = await runWorker({
+              task: "decrypt",
+              data: {
+                data: messageData,
+                key: this.data_user.keys.maintenance.sharedKey,
+                nonce: this.data_user.keys.maintenance.nonceKey,
+              },
+            });
+
+            const decompressedData = await runWorker({
+              task: "decompress",
+              data: decryptedData,
+            });
+
+            const unpackedData = msgpack.decode(decompressedData);
+
+            if (unpackedData.Request) {
+              // Handle request
+            } else {
+              const requestId = unpackedData.Response.id;
+              this.received_data[requestId] = unpackedData;
+            }
+          } catch (error) {
+            console.error(`Processing error: ${error}`);
+          }
+        } else {
+          break; // not enough data, wait for more
+        }
+      }
+    });
+
+    this.socket.on("error", (error) => {
+      console.error(`Socket error: ${error}`);
+    });
+
+    this.socket.on("end", () => {
+      console.log("Socket ended.");
+    });
   }
 
   public async Send_Message(message: any): Promise<number> {
@@ -213,6 +262,7 @@ export class SocketHandler {
     if (!this.data_user) {
       throw new Error("No Nodes or not inited");
     }
+    console.log(message)
 
     const packedMessage = msgpack.encode(message);
 
@@ -221,7 +271,7 @@ export class SocketHandler {
       data: packedMessage,
     });
 
-    const encryptedMessage = await runWorker({
+    let encryptedMessage = await runWorker({
       task: "encrypt",
       data: {
         data: compressedMessage,
@@ -230,7 +280,16 @@ export class SocketHandler {
       },
     });
 
-    this.socket.write(Buffer.from(encryptedMessage.length.toString(16), "hex"));
+    encryptedMessage = toBuffer(encryptedMessage.buffer);
+
+    const lengthBuffer = Buffer.alloc(4);
+    lengthBuffer.writeUInt32BE(encryptedMessage.length, 0);
+    console.log(
+      encryptedMessage,
+      fromBigUint(lengthBuffer),
+      encryptedMessage.length
+    );
+    this.socket.write(lengthBuffer);
     this.socket.write(encryptedMessage);
 
     return id_req;

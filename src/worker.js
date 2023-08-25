@@ -1,54 +1,37 @@
-import crypto from "crypto";
-import pkg from './zstd.cjs';
-const { decompressBuffer, compressBuffer } = pkg;
+import * as chacha20 from "chacha20";
+import { init, compress, decompress } from "@bokuweb/zstd-wasm";
 import { parentPort, workerData } from "worker_threads";
+let inited_state = false;
 
-if (parentPort) {
-  const { task, data } = workerData;
+(async () => {
+  if (parentPort) {
+    const { task, data } = workerData;
 
-  switch (task) {
-    case "encrypt":
-      const cipherEncrypt = crypto.createCipheriv(
-        "chacha20",
-        data.key,
-        data.nonce
-      );
-      parentPort.postMessage(
-        Buffer.concat([cipherEncrypt.update(data.data), cipherEncrypt.final()])
-      );
-      break;
+    switch (task) {
+      case "encrypt":
+        parentPort.postMessage(chacha20.encrypt(data.key, data.nonce, data.data));
+        break;
 
-    case "decrypt":
-      const cipherDecrypt = crypto.createDecipheriv(
-        "chacha20",
-        data.key,
-        data.nonce
-      );
-      parentPort.postMessage(
-        Buffer.concat([cipherDecrypt.update(data.data), cipherDecrypt.final()])
-      );
-      break;
+      case "decrypt":
+        parentPort.postMessage(chacha20.decrypt(data.key, data.nonce, data.data));
+        break;
 
-    case "compress":
-      compressBuffer(data, 21, (err, compressedBuffer) => {
-        if (err) {
-          // Handle the error appropriately
-          console.error("Compression error:", err);
-          return;
+      case "compress":
+      case "decompress":
+        if (inited_state === false) {
+          await init();
+          inited_state = true;
         }
-        parentPort.postMessage(compressedBuffer);
-      });
-      break;
 
-    case "decompress":
-      decompressBuffer(data, (err, decompressedBuffer) => {
-        if (err) {
-          // Handle the error appropriately
-          console.error("Decompression error:", err);
-          return;
-        }
-        parentPort.postMessage(decompressedBuffer);
-      });
-      break;
+      case "compress":
+        const compressed = compress(data, 21);
+        parentPort.postMessage(Buffer.from(decompress(compressed)));
+        break;
+
+      case "decompress":
+        const decompressed = decompress(compressed);
+        parentPort.postMessage(Buffer.from(decompress(decompressed)));
+        break;
+    }
   }
-}
+})();
