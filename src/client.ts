@@ -5,7 +5,7 @@ import { Worker } from "worker_threads";
 import { nonceGenerator, runWorker } from "./hasher.js";
 import * as msgpack from "msgpack-lite";
 import { sharedKey } from "curve25519-js";
-
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const num_cpus = os.cpus().length;
 
 const executor = new Worker("./src/worker.js", {
@@ -15,15 +15,15 @@ const executor = new Worker("./src/worker.js", {
 export class SocketHandler {
   private socket!: net.Socket;
   private list_nodes: Array<[string, number, boolean, number]> = [
-    ["0.0.0.0", 5050, false, 0],
+    ["0.0.0.0", 5050, true, 0],
   ];
-  private selected_node: [string, number, boolean, number] | null = null;
+  public selected_node: [string, number, boolean, number] | null = null;
   private received_data: { [key: number]: any } = {};
   private data_user: any = {};
   public is_listening: boolean = false;
 
   private async Checker_Exist_Host(): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise(async (resolve) => {
       for (let i = 0; i < this.list_nodes.length; i++) {
         const start = Date.now();
 
@@ -32,16 +32,15 @@ export class SocketHandler {
 
         this.socket.on("error", (error: any) => {
           if (error.code === "ECONNREFUSED") {
+            this.list_nodes[i][2] = false;
             console.error(
               `Connection refused to the server: ${error.address}:${error.port}`
             );
             if (this.list_nodes[i][0] === "0.0.0.0") {
               this.list_nodes[i][0] = "localhost";
-              this.socket.connect(
-                this.list_nodes[i][1],
-                this.list_nodes[i][0],
-              );
+              this.socket.connect(this.list_nodes[i][1], this.list_nodes[i][0]);
               this.list_nodes[i][2] = true;
+              this.socket.end();
             } else {
               this.list_nodes[i][2] = false;
             }
@@ -49,18 +48,16 @@ export class SocketHandler {
             console.error(`Socket error: ${error.message}`);
           }
         });
-
         this.socket.connect(
           this.list_nodes[i][1],
           this.list_nodes[i][0],
-          () => {
-            this.list_nodes[i][2] = true;
-          }
+          () => {}
         );
+        await delay(1000);
 
         this.socket.end();
         this.list_nodes[i][3] = parseFloat(
-          ((Date.now() - start) / 1000).toFixed(6)
+          ((Date.now() - start) / 1000 - 1).toFixed(6)
         );
 
         if (this.list_nodes[i][2]) {
@@ -75,6 +72,33 @@ export class SocketHandler {
     });
   }
 
+  private async connectAndRead(): Promise<Buffer> {
+    return new Promise(async (resolve, reject) => {
+      if (this.selected_node) {
+        this.socket = new net.Socket();
+        this.socket.connect(
+          this.selected_node[1],
+          this.selected_node[0],
+          () => {
+            console.log("Connected to the node.");
+          }
+        );
+
+        this.socket.on("data", (data) => {
+          resolve(data);
+          this.socket.destroy(); // Close the connection after receiving data
+        });
+
+        this.socket.on("error", (err) => {
+          reject(err);
+        });
+      } else {
+        await this.Checker_Exist_Host();
+        this.connectAndRead();
+      }
+    });
+  }
+
   public async Connect_To_Nodes(): Promise<boolean> {
     if (!this.selected_node) {
       await this.Checker_Exist_Host();
@@ -84,11 +108,8 @@ export class SocketHandler {
       return false;
     }
 
-    this.socket = new net.Socket();
-    this.socket.connect(this.selected_node[1], this.selected_node[0]);
-
-    let data = await this.socket.read(32);
-    console.log(data)
+    let data = await this.connectAndRead();
+    console.log(data);
     // Convert the server's public key to Uint8Array
     const serverPublicKey = Uint8Array.from(data);
 
@@ -97,15 +118,15 @@ export class SocketHandler {
       crypto.generateKeyPairSync("x25519");
 
     // Convert the private key to Uint8Array
-    const privateKey = Uint8Array.from(
-      privateKeyObject.export({ type: "pkcs8", format: "der" }).slice(-32)
-    );
-
-    // Compute the shared secret using curve25519-js
-    const sharedSecret = sharedKey(privateKey, serverPublicKey);
-    const nonceKey = nonceGenerator(Buffer.from(sharedSecret));
-    const publicKeySys = publicKey
+    const privateKey = privateKeyObject
       .export({ type: "pkcs8", format: "der" })
+      .slice(-32);
+    // Compute the shared secret using curve25519-js
+    const sharedSecretBuffer = sharedKey(Uint8Array.from(privateKey), serverPublicKey);
+    const sharedSecret = Buffer.from(sharedSecretBuffer);
+    const nonceKey = nonceGenerator(sharedSecret);
+    const publicKeySys = publicKey
+      .export({ type: "spki", format: "der" })
       .slice(-32);
     this.socket.write(publicKeySys);
 
@@ -119,11 +140,11 @@ export class SocketHandler {
           publicKey: data,
         },
         client: {
-          publicKey: publicKey,
+          publicKey: publicKeySys,
           privateKey: privateKey,
         },
         maintenance: {
-          sharedKey: sharedKey,
+          sharedKey: sharedSecret,
           nonceKey: nonceKey,
         },
       },
@@ -131,6 +152,7 @@ export class SocketHandler {
 
     this.is_listening = true;
     executor.postMessage(this.listen_for_messages);
+
     return true;
   }
 
@@ -182,7 +204,7 @@ export class SocketHandler {
 
   public async Send_Message(message: any): Promise<number> {
     if (!this.data_user || !this.data_user.keys) {
-      await this.Connect_To_Nodes()
+      await this.Connect_To_Nodes();
     }
     const id_req = Math.floor(Math.random() * 1000000) + 1;
 
